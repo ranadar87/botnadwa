@@ -1,30 +1,33 @@
 const express = require("express");
-const { Client, LocalAuth } = require("whatsapp-web.js");
+const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
 const qrcode = require("qrcode");
+const fetch = require("node-fetch");
 
 const app = express();
 app.use(express.json());
 
 const API_SECRET = process.env.API_SECRET_KEY;
 const BASE44_WEBHOOK_URL = process.env.BASE44_WEBHOOK_URL;
+
+// FIX 1: נתיב ל-Chromium שהותקן ב-Dockerfile
+const CHROMIUM_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium";
+
 const sessions = {};
 
 // ── Auth middleware ───────────────────────────────────────────────
 app.use((req, res, next) => {
+  if (req.path === "/health") return next(); // health ציבורי
   const auth = req.headers.authorization?.replace("Bearer ", "");
   if (auth !== API_SECRET) return res.status(401).json({ error: "Unauthorized" });
   next();
 });
 
-// ── Helper: webhook ל-BASE44 עם auth header ──────────────────
+// ── Helper: webhook ל-BASE44 ─────────────────────────────────────
 async function notifyBase44(url, payload) {
   const target = url || BASE44_WEBHOOK_URL;
-  if (!target) {
-    console.error("[webhook] no URL provided");
-    return;
-  }
+  if (!target) return console.error("[webhook] no URL");
   try {
-    await fetch(target, {
+    const res = await fetch(target, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -32,6 +35,7 @@ async function notifyBase44(url, payload) {
       },
       body: JSON.stringify({ ...payload, timestamp: new Date().toISOString() }),
     });
+    console.log(`[webhook] ${payload.event || payload.status} → ${res.status}`);
   } catch (e) {
     console.error("[webhook] failed:", e.message);
   }
@@ -42,7 +46,6 @@ app.post("/session/create", async (req, res) => {
   const { sessionId, webhookUrl } = req.body;
   if (!sessionId) return res.status(400).json({ error: "sessionId required" });
 
-  // אם session קיימת — החזר סטטוס נוכחי
   if (sessions[sessionId]) {
     const s = sessions[sessionId];
     return res.json({ ok: true, existing: true, status: s.status, qr: s.qr, phone: s.phone });
@@ -51,19 +54,33 @@ app.post("/session/create", async (req, res) => {
   const callbackUrl = webhookUrl || BASE44_WEBHOOK_URL;
 
   const client = new Client({
-    authStrategy: new LocalAuth({ clientId: sessionId }),
-    puppeteer: { args: ["--no-sandbox", "--disable-setuid-sandbox", "--disable-gpu"] }
+    authStrategy: new LocalAuth({
+      clientId: sessionId,
+      dataPath: "/app/.wwebjs_auth",
+    }),
+    puppeteer: {
+      // FIX 1: תמיד השתמש ב-Chromium המותקן — לא בזה שנורד
+      executablePath: CHROMIUM_PATH,
+      headless: true,
+      args: [
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--no-first-run",
+        "--no-zygote",
+        "--single-process",
+      ],
+    },
   });
 
   sessions[sessionId] = { client, status: "initializing", qr: null, phone: null, callbackUrl };
 
-  // QR מוכן → שלח ל-BASE44 מיידית
   client.on("qr", async (qr) => {
     const qrDataUrl = await qrcode.toDataURL(qr);
     sessions[sessionId].qr = qrDataUrl;
     sessions[sessionId].status = "pending_qr";
     console.log(`[${sessionId}] QR ready`);
-
     await notifyBase44(callbackUrl, {
       event: "qr_updated",
       sessionId,
@@ -71,58 +88,58 @@ app.post("/session/create", async (req, res) => {
     });
   });
 
-  // חובר! → שמור phone + הודע ל-BASE44 מיידית
   client.on("ready", async () => {
     const phone = client.info?.wid?.user || null;
     sessions[sessionId].status = "connected";
     sessions[sessionId].qr = null;
     sessions[sessionId].phone = phone;
     sessions[sessionId].connectedAt = new Date().toISOString();
-    console.log(`[${sessionId}] Connected, phone: ${phone}`);
-
+    console.log(`[${sessionId}] Connected — phone: ${phone}`);
     await notifyBase44(callbackUrl, {
       event: "session_connected",
       sessionId,
-      status: "connected",
       data: { phone, connectedAt: sessions[sessionId].connectedAt },
     });
   });
 
-  // ניתוק → נקה ועדכן
   client.on("disconnected", async (reason) => {
     console.log(`[${sessionId}] Disconnected:`, reason);
     const s = sessions[sessionId];
     await notifyBase44(s?.callbackUrl, {
       event: "session_disconnected",
       sessionId,
-      status: "disconnected",
       data: { reason },
     });
     try { await client.destroy(); } catch (_) {}
     delete sessions[sessionId];
   });
 
-  // ACK handler → delivered / read webhooks
   client.on("message_ack", async (msg, ack) => {
-    // ack: 1=clock(pending), 2=sent(checkmark), 3=delivered, 4=read(blue)
     const statusMap = { 2: "sent", 3: "delivered", 4: "read" };
     const status = statusMap[ack];
     if (!status) return;
-
-    const msgId = msg.id?._serialized || msg.id?.id || null;
     const s = sessions[sessionId];
-    console.log(`[${sessionId}] ACK ${status} for ${msgId}`);
-
-    if (s) {
-      await notifyBase44(s.callbackUrl, {
-        status,
-        messageId: msgId,
-        data: { timestamp: new Date().toISOString() },
-      });
-    }
+    if (!s) return;
+    const msgId = msg.id?._serialized || msg.id?.id || null;
+    console.log(`[${sessionId}] ACK ${status} — ${msgId}`);
+    await notifyBase44(s.callbackUrl, {
+      status,
+      messageId: msgId,
+      data: { timestamp: new Date().toISOString() },
+    });
   });
 
-  client.initialize();
+  // FIX 2: לכוד שגיאות אתחול — בלי זה crash לא מטופל
+  client.initialize().catch(async (err) => {
+    console.error(`[${sessionId}] initialize error:`, err.message);
+    sessions[sessionId].status = "failed";
+    await notifyBase44(callbackUrl, {
+      event: "session_failed",
+      sessionId,
+      data: { error: err.message },
+    });
+  });
+
   res.json({ ok: true, sessionId, status: "initializing" });
 });
 
@@ -143,12 +160,11 @@ app.delete("/session/delete/:sessionId", async (req, res) => {
   const { sessionId } = req.params;
   const s = sessions[sessionId];
   if (!s) return res.json({ ok: true, message: "Already gone" });
-
   try { await s.client.destroy(); } catch (e) {
     console.error(`[${sessionId}] destroy error:`, e.message);
   }
   delete sessions[sessionId];
-  console.log(`[${sessionId}] Deleted by request`);
+  console.log(`[${sessionId}] Deleted`);
   res.json({ ok: true });
 });
 
@@ -164,21 +180,20 @@ app.post("/message/send", async (req, res) => {
     });
   }
 
+  const callbackUrl = webhookUrl || s.callbackUrl || BASE44_WEBHOOK_URL;
+
   try {
     const digits = to.replace(/\D/g, "");
     const chatId = `${digits}@c.us`;
 
     if (mediaUrl) {
-      // שליחה עם מדיה
-      const media = await require("node-fetch")(mediaUrl).then(r => r.buffer());
-      const msgMedia = require("whatsapp-web.js").MessageMedia.fromBuffer(media, mediaUrl.split('.').pop());
-      await s.client.sendMessage(chatId, msgMedia, { caption: message });
+      // FIX 3: MessageMedia.fromUrl — הדרך הנכונה, לא fromBuffer
+      const media = await MessageMedia.fromUrl(mediaUrl, { unsafeMime: true });
+      await s.client.sendMessage(chatId, media, { caption: message });
     } else {
-      // שליחה רגילה
       await s.client.sendMessage(chatId, message);
     }
 
-    const callbackUrl = webhookUrl || s.callbackUrl || BASE44_WEBHOOK_URL;
     await notifyBase44(callbackUrl, {
       status: "sent",
       messageId,
@@ -188,7 +203,6 @@ app.post("/message/send", async (req, res) => {
     res.json({ ok: true, queued: true });
   } catch (e) {
     console.error(`[${sessionId}] send error:`, e.message);
-    const callbackUrl = webhookUrl || s.callbackUrl || BASE44_WEBHOOK_URL;
     await notifyBase44(callbackUrl, {
       status: "failed",
       messageId,
@@ -203,13 +217,14 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     uptime: Math.floor(process.uptime()),
+    chromium: CHROMIUM_PATH,
     activeSessions: Object.keys(sessions).length,
     sessions: Object.entries(sessions).map(([id, s]) => ({
-      id, status: s.status, phone: s.phone || null
+      id, status: s.status, phone: s.phone || null,
     })),
   });
 });
 
-app.listen(process.env.PORT || 8002, () =>
-  console.log("WA Server running on port", process.env.PORT || 8002)
+app.listen(process.env.PORT || 8080, () =>
+  console.log("WA Server running on port", process.env.PORT || 8080)
 );
