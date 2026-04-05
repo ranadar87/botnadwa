@@ -16,7 +16,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// ── Helper: שלח webhook ל-BASE44 עם auth header ──────────────────
+// ── Helper: webhook ל-BASE44 עם auth header ──────────────────
 async function notifyBase44(url, payload) {
   const target = url || BASE44_WEBHOOK_URL;
   if (!target) {
