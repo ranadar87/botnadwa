@@ -2,21 +2,20 @@ const express = require("express");
 const { Client, LocalAuth, MessageMedia } = require("whatsapp-web.js");
 const qrcode = require("qrcode");
 const fetch = require("node-fetch");
+const fs = require("fs");
 
 const app = express();
 app.use(express.json());
 
 const API_SECRET = process.env.API_SECRET_KEY;
 const BASE44_WEBHOOK_URL = process.env.BASE44_WEBHOOK_URL;
-
-// FIX 1: נתיב ל-Chromium שהותקן ב-Dockerfile
 const CHROMIUM_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromium";
 
 const sessions = {};
 
 // ── Auth middleware ───────────────────────────────────────────────
 app.use((req, res, next) => {
-  if (req.path === "/health") return next(); // health ציבורי
+  if (req.path === "/health") return next();
   const auth = req.headers.authorization?.replace("Bearer ", "");
   if (auth !== API_SECRET) return res.status(401).json({ error: "Unauthorized" });
   next();
@@ -41,17 +40,21 @@ async function notifyBase44(url, payload) {
   }
 }
 
-// ── POST /session/create ─────────────────────────────────────────
-app.post("/session/create", async (req, res) => {
-  const { sessionId, webhookUrl } = req.body;
-  if (!sessionId) return res.status(400).json({ error: "sessionId required" });
+// ── Helper: מחק lock file ─────────────────────────────────────────
+function clearLock(sessionId) {
+  const paths = [
+    `/app/.wwebjs_auth/session-${sessionId}/.wwebjs_auth.lock`,
+    `/app/.wwebjs_auth/session-${sessionId}/SingletonLock`,
+    `/app/.wwebjs_auth/session-${sessionId}/SingletonCookie`,
+  ];
+  paths.forEach(p => {
+    try { fs.unlinkSync(p); console.log(`[${sessionId}] cleared: ${p}`); } catch (_) {}
+  });
+}
 
-  if (sessions[sessionId]) {
-    const s = sessions[sessionId];
-    return res.json({ ok: true, existing: true, status: s.status, qr: s.qr, phone: s.phone });
-  }
-
-  const callbackUrl = webhookUrl || BASE44_WEBHOOK_URL;
+// ── Helper: אתחל client ───────────────────────────────────────────
+async function initClient(sessionId, callbackUrl, attempt = 1) {
+  clearLock(sessionId);
 
   const client = new Client({
     authStrategy: new LocalAuth({
@@ -59,7 +62,6 @@ app.post("/session/create", async (req, res) => {
       dataPath: "/app/.wwebjs_auth",
     }),
     puppeteer: {
-      // FIX 1: תמיד השתמש ב-Chromium המותקן — לא בזה שנורד
       executablePath: CHROMIUM_PATH,
       headless: true,
       args: [
@@ -129,17 +131,39 @@ app.post("/session/create", async (req, res) => {
     });
   });
 
-  // FIX 2: לכוד שגיאות אתחול — בלי זה crash לא מטופל
   client.initialize().catch(async (err) => {
-    console.error(`[${sessionId}] initialize error:`, err.message);
-    sessions[sessionId].status = "failed";
+    console.error(`[${sessionId}] initialize error (attempt ${attempt}):`, err.message);
+
+    // אם browser תפוס — המתן ונסה שוב פעם אחת
+    if (err.message.includes("already running") && attempt === 1) {
+      console.log(`[${sessionId}] retrying in 4s...`);
+      try { await client.destroy(); } catch (_) {}
+      delete sessions[sessionId];
+      await new Promise(r => setTimeout(r, 4000));
+      return initClient(sessionId, callbackUrl, 2);
+    }
+
+    if (sessions[sessionId]) sessions[sessionId].status = "failed";
     await notifyBase44(callbackUrl, {
       event: "session_failed",
       sessionId,
       data: { error: err.message },
     });
   });
+}
 
+// ── POST /session/create ─────────────────────────────────────────
+app.post("/session/create", async (req, res) => {
+  const { sessionId, webhookUrl } = req.body;
+  if (!sessionId) return res.status(400).json({ error: "sessionId required" });
+
+  if (sessions[sessionId]) {
+    const s = sessions[sessionId];
+    return res.json({ ok: true, existing: true, status: s.status, qr: s.qr, phone: s.phone });
+  }
+
+  const callbackUrl = webhookUrl || BASE44_WEBHOOK_URL;
+  await initClient(sessionId, callbackUrl);
   res.json({ ok: true, sessionId, status: "initializing" });
 });
 
@@ -164,6 +188,7 @@ app.delete("/session/delete/:sessionId", async (req, res) => {
     console.error(`[${sessionId}] destroy error:`, e.message);
   }
   delete sessions[sessionId];
+  clearLock(sessionId);
   console.log(`[${sessionId}] Deleted`);
   res.json({ ok: true });
 });
@@ -187,7 +212,6 @@ app.post("/message/send", async (req, res) => {
     const chatId = `${digits}@c.us`;
 
     if (mediaUrl) {
-      // FIX 3: MessageMedia.fromUrl — הדרך הנכונה, לא fromBuffer
       const media = await MessageMedia.fromUrl(mediaUrl, { unsafeMime: true });
       await s.client.sendMessage(chatId, media, { caption: message });
     } else {
