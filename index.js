@@ -50,23 +50,44 @@ app.post("/session/create", async (req, res) => {
 app.get("/session/status/:sessionId", (req, res) => {
   const s = sessions[req.params.sessionId];
   if (!s) return res.status(404).json({ error: "Not found" });
-  res.json({ status: s.status, qr: s.qr });
+  const phone = s.client?.info?.wid?.user || null;
+  res.json({ status: s.status, qr: s.qr, phone });
+});
+
+// Delete session
+app.delete("/session/delete/:sessionId", async (req, res) => {
+  const s = sessions[req.params.sessionId];
+  if (s?.client) {
+    await s.client.logout().catch(() => {});
+  }
+  delete sessions[req.params.sessionId];
+  res.json({ ok: true });
 });
 
 // Send message
 app.post("/message/send", async (req, res) => {
-  const { sessionId, to, message, messageId, webhookUrl } = req.body;
+  const { sessionId, to, message, messageId } = req.body;
+  const webhookUrl = req.headers["x-webhook-url"];
+  const webhookSecret = req.headers["x-webhook-secret"];
   const s = sessions[sessionId];
+  
   if (!s || s.status !== "connected") return res.status(400).json({ error: "Not connected" });
 
   const phone = to.replace(/\D/g, "") + "@c.us";
   await s.client.sendMessage(phone, message);
 
-  if (webhookUrl) {
+  if (webhookUrl && webhookSecret) {
     fetch(webhookUrl, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ event: "sent", messageId, to }),
+      headers: { 
+        "Content-Type": "application/json",
+        "X-Railway-Secret": webhookSecret,
+      },
+      body: JSON.stringify({ 
+        messageId, 
+        status: "sent",
+        timestamp: new Date().toISOString(),
+      }),
     }).catch(() => {});
   }
 
