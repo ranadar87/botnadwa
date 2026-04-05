@@ -54,7 +54,7 @@ app.post("/session/create", async (req, res) => {
 
   sessions[sessionId] = { client, status: "initializing", qr: null, phone: null, callbackUrl };
 
-  // QR מוכן → שלח ל-BASE44 מיידית
+  // QR מוכן → שלח -BASE44 מיידית
   client.on("qr", async (qr) => {
     const qrDataUrl = await qrcode.toDataURL(qr);
     sessions[sessionId].qr = qrDataUrl;
