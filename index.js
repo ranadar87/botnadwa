@@ -225,6 +225,6 @@ app.get("/health", (req, res) => {
   });
 });
 
-app.listen(process.env.PORT || 8080, () =>
-  console.log("WA Server running on port", process.env.PORT || 8080)
+app.listen(process.env.PORT || 8002, () =>
+  console.log("WA Server running on port", process.env.PORT || 8002)
 );
