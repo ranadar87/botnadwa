@@ -6,7 +6,7 @@ const app = express();
 app.use(express.json());
 
 const API_SECRET = process.env.API_SECRET_KEY;
-const BASE44_WEBHOOK_URL = process.env.BASE44_WEBHOOK_URL; // הוסף ב-Railway Variables
+const BASE44_WEBHOOK_URL = process.env.BASE44_WEBHOOK_URL;
 const sessions = {};
 
 // ── Auth middleware ───────────────────────────────────────────────
@@ -19,13 +19,16 @@ app.use((req, res, next) => {
 // ── Helper: שלח webhook ל-BASE44 עם auth header ──────────────────
 async function notifyBase44(url, payload) {
   const target = url || BASE44_WEBHOOK_URL;
-  if (!target) return;
+  if (!target) {
+    console.error("[webhook] no URL provided");
+    return;
+  }
   try {
     await fetch(target, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-railway-secret": API_SECRET,   // ← BASE44 מאמת עם זה
+        "x-railway-secret": API_SECRET,
       },
       body: JSON.stringify({ ...payload, timestamp: new Date().toISOString() }),
     });
@@ -54,18 +57,17 @@ app.post("/session/create", async (req, res) => {
 
   sessions[sessionId] = { client, status: "initializing", qr: null, phone: null, callbackUrl };
 
-  // QR מוכן → שלח -BASE44 מיידית
+  // QR מוכן → שלח ל-BASE44 מיידית
   client.on("qr", async (qr) => {
     const qrDataUrl = await qrcode.toDataURL(qr);
     sessions[sessionId].qr = qrDataUrl;
     sessions[sessionId].status = "pending_qr";
     console.log(`[${sessionId}] QR ready`);
 
-    // FIX 1: push QR ל-BASE44 — UI יתעדכן מיד בלי לחכות לפולינג
     await notifyBase44(callbackUrl, {
       event: "qr_updated",
       sessionId,
-      qr: qrDataUrl,
+      data: { qr: qrDataUrl },
     });
   });
 
@@ -78,13 +80,11 @@ app.post("/session/create", async (req, res) => {
     sessions[sessionId].connectedAt = new Date().toISOString();
     console.log(`[${sessionId}] Connected, phone: ${phone}`);
 
-    // FIX 1: push "connected" ל-BASE44 — זה פותר את עיכוב הUI לאחר סריקה
     await notifyBase44(callbackUrl, {
       event: "session_connected",
       sessionId,
       status: "connected",
-      phone,
-      connectedAt: sessions[sessionId].connectedAt,
+      data: { phone, connectedAt: sessions[sessionId].connectedAt },
     });
   });
 
@@ -96,28 +96,30 @@ app.post("/session/create", async (req, res) => {
       event: "session_disconnected",
       sessionId,
       status: "disconnected",
-      reason,
+      data: { reason },
     });
     try { await client.destroy(); } catch (_) {}
     delete sessions[sessionId];
   });
 
-  // FIX 2: ACK handler → delivered / read webhooks
+  // ACK handler → delivered / read webhooks
   client.on("message_ack", async (msg, ack) => {
     // ack: 1=clock(pending), 2=sent(checkmark), 3=delivered, 4=read(blue)
     const statusMap = { 2: "sent", 3: "delivered", 4: "read" };
     const status = statusMap[ack];
     if (!status) return;
 
-    const s = sessions[sessionId];
     const msgId = msg.id?._serialized || msg.id?.id || null;
+    const s = sessions[sessionId];
     console.log(`[${sessionId}] ACK ${status} for ${msgId}`);
 
-    await notifyBase44(s?.callbackUrl, {
-      // FIX 3: שלח "status" לא "event" — זה מה שBASE44 מצפה
-      status,
-      messageId: msgId,
-    });
+    if (s) {
+      await notifyBase44(s.callbackUrl, {
+        status,
+        messageId: msgId,
+        data: { timestamp: new Date().toISOString() },
+      });
+    }
   });
 
   client.initialize();
@@ -137,7 +139,6 @@ app.get("/session/status/:sessionId", (req, res) => {
 });
 
 // ── DELETE /session/delete/:sessionId ────────────────────────────
-// FIX 4: endpoint חסר — נדרש לכפתור ה"נתק" ב-BASE44
 app.delete("/session/delete/:sessionId", async (req, res) => {
   const { sessionId } = req.params;
   const s = sessions[sessionId];
@@ -164,18 +165,24 @@ app.post("/message/send", async (req, res) => {
   }
 
   try {
-    // נקה מספר טלפון — הסר הכל חוץ מספרות
     const digits = to.replace(/\D/g, "");
     const chatId = `${digits}@c.us`;
 
-    await s.client.sendMessage(chatId, message);
+    if (mediaUrl) {
+      // שליחה עם מדיה
+      const media = await require("node-fetch")(mediaUrl).then(r => r.buffer());
+      const msgMedia = require("whatsapp-web.js").MessageMedia.fromBuffer(media, mediaUrl.split('.').pop());
+      await s.client.sendMessage(chatId, msgMedia, { caption: message });
+    } else {
+      // שליחה רגילה
+      await s.client.sendMessage(chatId, message);
+    }
 
-    // FIX 3: שלח status:"sent" ולא event:"sent"
     const callbackUrl = webhookUrl || s.callbackUrl || BASE44_WEBHOOK_URL;
     await notifyBase44(callbackUrl, {
       status: "sent",
       messageId,
-      to: digits,
+      data: { to: digits },
     });
 
     res.json({ ok: true, queued: true });
@@ -185,7 +192,7 @@ app.post("/message/send", async (req, res) => {
     await notifyBase44(callbackUrl, {
       status: "failed",
       messageId,
-      error: e.message,
+      data: { error: e.message },
     });
     res.status(500).json({ error: e.message });
   }
