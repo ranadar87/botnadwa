@@ -1,7 +1,7 @@
 {
   "name": "whatsapp-server",
-  "version": "1.1.0",
-  "description": "WhatsApp Web.js Server",
+  "version": "1.2.0",
+  "description": "WhatsApp Web.js server for Railway",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
