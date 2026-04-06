@@ -5,7 +5,7 @@ const fetch = require("node-fetch");
 const fs = require("fs");
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "10mb" }));
 
 const API_SECRET = process.env.API_SECRET_KEY;
 const BASE44_WEBHOOK_URL = process.env.BASE44_WEBHOOK_URL;
@@ -13,7 +13,6 @@ const CHROMIUM_PATH = process.env.PUPPETEER_EXECUTABLE_PATH || "/usr/bin/chromiu
 
 const sessions = {};
 
-// ── Auth middleware ───────────────────────────────────────────────
 app.use((req, res, next) => {
   if (req.path === "/health") return next();
   const auth = req.headers.authorization?.replace("Bearer ", "");
@@ -21,10 +20,13 @@ app.use((req, res, next) => {
   next();
 });
 
-// ── Helper: webhook ל-BASE44 ─────────────────────────────────────
 async function notifyBase44(url, payload) {
   const target = url || BASE44_WEBHOOK_URL;
-  if (!target) return console.error("[webhook] no URL");
+  if (!target) {
+    console.error("[webhook] no URL configured");
+    return;
+  }
+
   try {
     const res = await fetch(target, {
       method: "POST",
@@ -32,27 +34,33 @@ async function notifyBase44(url, payload) {
         "Content-Type": "application/json",
         "x-railway-secret": API_SECRET,
       },
-      body: JSON.stringify({ ...payload, timestamp: new Date().toISOString() }),
+      body: JSON.stringify({
+        ...payload,
+        timestamp: new Date().toISOString(),
+      }),
     });
-    console.log(`[webhook] ${payload.event || payload.status} → ${res.status}`);
+
+    console.log(`[webhook] ${payload.event || payload.status} -> ${res.status}`);
   } catch (e) {
     console.error("[webhook] failed:", e.message);
   }
 }
 
-// ── Helper: מחק lock file ─────────────────────────────────────────
 function clearLock(sessionId) {
   const paths = [
     `/app/.wwebjs_auth/session-${sessionId}/.wwebjs_auth.lock`,
     `/app/.wwebjs_auth/session-${sessionId}/SingletonLock`,
     `/app/.wwebjs_auth/session-${sessionId}/SingletonCookie`,
   ];
-  paths.forEach(p => {
-    try { fs.unlinkSync(p); console.log(`[${sessionId}] cleared: ${p}`); } catch (_) {}
-  });
+
+  for (const p of paths) {
+    try {
+      fs.unlinkSync(p);
+      console.log(`[${sessionId}] cleared lock: ${p}`);
+    } catch (_) {}
+  }
 }
 
-// ── Helper: אתחל client ───────────────────────────────────────────
 async function initClient(sessionId, callbackUrl, attempt = 1) {
   clearLock(sessionId);
 
@@ -76,13 +84,24 @@ async function initClient(sessionId, callbackUrl, attempt = 1) {
     },
   });
 
-  sessions[sessionId] = { client, status: "initializing", qr: null, phone: null, callbackUrl };
+  sessions[sessionId] = {
+    client,
+    status: "initializing",
+    qr: null,
+    phone: null,
+    connectedAt: null,
+    callbackUrl,
+  };
 
   client.on("qr", async (qr) => {
     const qrDataUrl = await qrcode.toDataURL(qr);
+    if (!sessions[sessionId]) return;
+
     sessions[sessionId].qr = qrDataUrl;
     sessions[sessionId].status = "pending_qr";
+
     console.log(`[${sessionId}] QR ready`);
+
     await notifyBase44(callbackUrl, {
       event: "qr_updated",
       sessionId,
@@ -92,58 +111,86 @@ async function initClient(sessionId, callbackUrl, attempt = 1) {
 
   client.on("ready", async () => {
     const phone = client.info?.wid?.user || null;
+    if (!sessions[sessionId]) return;
+
     sessions[sessionId].status = "connected";
     sessions[sessionId].qr = null;
     sessions[sessionId].phone = phone;
     sessions[sessionId].connectedAt = new Date().toISOString();
-    console.log(`[${sessionId}] Connected — phone: ${phone}`);
+
+    console.log(`[${sessionId}] Connected - phone: ${phone}`);
+
     await notifyBase44(callbackUrl, {
       event: "session_connected",
       sessionId,
-      data: { phone, connectedAt: sessions[sessionId].connectedAt },
+      data: {
+        phone,
+        connectedAt: sessions[sessionId].connectedAt,
+      },
     });
   });
 
   client.on("disconnected", async (reason) => {
-    console.log(`[${sessionId}] Disconnected:`, reason);
-    const s = sessions[sessionId];
-    await notifyBase44(s?.callbackUrl, {
+    console.log(`[${sessionId}] Disconnected: ${reason}`);
+
+    const session = sessions[sessionId];
+
+    await notifyBase44(session?.callbackUrl, {
       event: "session_disconnected",
       sessionId,
       data: { reason },
     });
-    try { await client.destroy(); } catch (_) {}
+
+    try {
+      await client.destroy();
+    } catch (_) {}
+
     delete sessions[sessionId];
   });
 
   client.on("message_ack", async (msg, ack) => {
-    const statusMap = { 2: "sent", 3: "delivered", 4: "read" };
+    const statusMap = {
+      2: "sent",
+      3: "delivered",
+      4: "read",
+    };
+
     const status = statusMap[ack];
     if (!status) return;
-    const s = sessions[sessionId];
-    if (!s) return;
+
+    const session = sessions[sessionId];
+    if (!session) return;
+
     const msgId = msg.id?._serialized || msg.id?.id || null;
-    console.log(`[${sessionId}] ACK ${status} — ${msgId}`);
-    await notifyBase44(s.callbackUrl, {
+
+    console.log(`[${sessionId}] ACK ${status} - ${msgId}`);
+
+    await notifyBase44(session.callbackUrl, {
       status,
       messageId: msgId,
-      data: { timestamp: new Date().toISOString() },
+      data: {
+        timestamp: new Date().toISOString(),
+      },
     });
   });
 
   client.initialize().catch(async (err) => {
     console.error(`[${sessionId}] initialize error (attempt ${attempt}):`, err.message);
 
-    // אם browser תפוס — המתן ונסה שוב פעם אחת
     if (err.message.includes("already running") && attempt === 1) {
       console.log(`[${sessionId}] retrying in 4s...`);
-      try { await client.destroy(); } catch (_) {}
+      try {
+        await client.destroy();
+      } catch (_) {}
       delete sessions[sessionId];
-      await new Promise(r => setTimeout(r, 4000));
+      await new Promise((r) => setTimeout(r, 4000));
       return initClient(sessionId, callbackUrl, 2);
     }
 
-    if (sessions[sessionId]) sessions[sessionId].status = "failed";
+    if (sessions[sessionId]) {
+      sessions[sessionId].status = "failed";
+    }
+
     await notifyBase44(callbackUrl, {
       event: "session_failed",
       sessionId,
@@ -152,25 +199,45 @@ async function initClient(sessionId, callbackUrl, attempt = 1) {
   });
 }
 
-// ── POST /session/create ─────────────────────────────────────────
 app.post("/session/create", async (req, res) => {
   const { sessionId, webhookUrl } = req.body;
-  if (!sessionId) return res.status(400).json({ error: "sessionId required" });
+
+  if (!sessionId) {
+    return res.status(400).json({ error: "sessionId required" });
+  }
 
   if (sessions[sessionId]) {
     const s = sessions[sessionId];
-    return res.json({ ok: true, existing: true, status: s.status, qr: s.qr, phone: s.phone });
+    return res.json({
+      ok: true,
+      existing: true,
+      status: s.status,
+      qr: s.qr,
+      phone: s.phone,
+      connectedAt: s.connectedAt,
+    });
   }
 
   const callbackUrl = webhookUrl || BASE44_WEBHOOK_URL;
   await initClient(sessionId, callbackUrl);
-  res.json({ ok: true, sessionId, status: "initializing" });
+
+  res.json({
+    ok: true,
+    sessionId,
+    status: "initializing",
+  });
 });
 
-// ── GET /session/status/:sessionId ───────────────────────────────
 app.get("/session/status/:sessionId", (req, res) => {
   const s = sessions[req.params.sessionId];
-  if (!s) return res.status(404).json({ error: "Not found", status: "not_found" });
+
+  if (!s) {
+    return res.status(404).json({
+      error: "Not found",
+      status: "not_found",
+    });
+  }
+
   res.json({
     status: s.status,
     qr: s.qr,
@@ -179,21 +246,28 @@ app.get("/session/status/:sessionId", (req, res) => {
   });
 });
 
-// ── DELETE /session/delete/:sessionId ────────────────────────────
 app.delete("/session/delete/:sessionId", async (req, res) => {
   const { sessionId } = req.params;
   const s = sessions[sessionId];
-  if (!s) return res.json({ ok: true, message: "Already gone" });
-  try { await s.client.destroy(); } catch (e) {
+
+  if (!s) {
+    return res.json({ ok: true, message: "Already gone" });
+  }
+
+  try {
+    await s.client.destroy();
+  } catch (e) {
     console.error(`[${sessionId}] destroy error:`, e.message);
   }
+
   delete sessions[sessionId];
   clearLock(sessionId);
+
   console.log(`[${sessionId}] Deleted`);
+
   res.json({ ok: true });
 });
 
-// ── POST /message/send ───────────────────────────────────────────
 app.post("/message/send", async (req, res) => {
   const { sessionId, to, message, messageId, webhookUrl, mediaUrl } = req.body;
   const s = sessions[sessionId];
@@ -208,14 +282,18 @@ app.post("/message/send", async (req, res) => {
   const callbackUrl = webhookUrl || s.callbackUrl || BASE44_WEBHOOK_URL;
 
   try {
-    const digits = to.replace(/\D/g, "");
+    const digits = String(to || "").replace(/\D/g, "");
     const chatId = `${digits}@c.us`;
+
+    if (!digits) {
+      throw new Error("Invalid recipient phone");
+    }
 
     if (mediaUrl) {
       const media = await MessageMedia.fromUrl(mediaUrl, { unsafeMime: true });
-      await s.client.sendMessage(chatId, media, { caption: message });
+      await s.client.sendMessage(chatId, media, { caption: message || "" });
     } else {
-      await s.client.sendMessage(chatId, message);
+      await s.client.sendMessage(chatId, message || "");
     }
 
     await notifyBase44(callbackUrl, {
@@ -227,16 +305,17 @@ app.post("/message/send", async (req, res) => {
     res.json({ ok: true, queued: true });
   } catch (e) {
     console.error(`[${sessionId}] send error:`, e.message);
+
     await notifyBase44(callbackUrl, {
       status: "failed",
       messageId,
       data: { error: e.message },
     });
+
     res.status(500).json({ error: e.message });
   }
 });
 
-// ── GET /health ──────────────────────────────────────────────────
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
@@ -244,11 +323,13 @@ app.get("/health", (req, res) => {
     chromium: CHROMIUM_PATH,
     activeSessions: Object.keys(sessions).length,
     sessions: Object.entries(sessions).map(([id, s]) => ({
-      id, status: s.status, phone: s.phone || null,
+      id,
+      status: s.status,
+      phone: s.phone || null,
     })),
   });
 });
 
-app.listen(process.env.PORT || 8080, "0.0.0.0", () =>
-  console.log("WA Server running on port", process.env.PORT || 8080)
-);
+app.listen(process.env.PORT || 8080, "0.0.0.0", () => {
+  console.log("WA Server running on port", process.env.PORT || 8080);
+});
